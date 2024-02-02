@@ -6770,13 +6770,14 @@ task1/training/t1_training/TRAINING DATA (2023 COLLECTION)/new_data/s_3103.trec
 task1/training/t1_training/TRAINING DATA (2023 COLLECTION)/new_data/s_3104.trec
 task1/training/t1_training/TRAINING DATA (2023 COLLECTION)/new_data/s_3105.trec
 task1/training/t1_training/TRAINING DATA (2023 COLLECTION)/new_data/s_3106.trec
+task1_test/s_0.trec
+task1_test/s_1.trec
+task1_test/s_2.trec
 task2/training/t2_training_collection_2024.zip
 task3/t3_training/TRAINING DATA (FROM ERISK 2022 AND 2023)/2022/eRisk2022_T3.ZIP
 task3/t3_training/TRAINING DATA (FROM ERISK 2022 AND 2023)/2023/erisk 2023_T3.zip
 task3/training/t3_training_collection_2024.zip
+.gitignore
 parquet/s_0.parquet
 parquet/s_1.parquet
 parquet/s_2.parquet
-task1_test/s_0.trec
-task1_test/s_1.trec
-task1_test/s_2.trec
