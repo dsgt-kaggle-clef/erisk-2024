@@ -3,7 +3,7 @@ from erisk.utils import spark_resource
 from pyspark.sql import functions as F
 from pyspark.ml.functions import array_to_vector
 from pyspark.ml.classification import NaiveBayes
-from pyspark.ml import Pipeline
+from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.feature import MinMaxScaler
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 import tqdm
@@ -11,6 +11,13 @@ import luigi.contrib.gcs
 import json
 import numpy as np
 import time
+
+from pyspark.sql import functions as F, Window
+from pyspark.ml.functions import vector_to_array
+from functools import reduce
+from pyspark.ml import PipelineModel
+from pyspark.ml.functions import array_to_vector
+from pyspark.sql import functions as F
 
 
 def pivot_training(df, feature_columns, target_prefix="target_"):
@@ -108,6 +115,7 @@ class TrainModel(luigi.Task):
     model_path = luigi.Parameter()
     eval_path = luigi.Parameter()
     train_percent = luigi.FloatParameter(default=80)
+    feature_column = luigi.Parameter(default="tfidf")
 
     def output(self):
         return [
@@ -120,11 +128,11 @@ class TrainModel(luigi.Task):
             start_time = time.time()
             df = pivot_training(
                 load_dataset(spark, self.train_labels_path, self.dataset_path),
-                ["hashingtf", "tfidf"],
+                [self.feature_column],
             ).cache()
             df.printSchema()
             pipeline = build_nb_model_pipeline(
-                "tfidf", [c for c in df.columns if c.startswith("target_")]
+                self.feature_column, [c for c in df.columns if c.startswith("target_")]
             )
             model = pipeline.fit(df.where(f"sampleid < {self.train_percent}").fillna(0))
             predictions = model.transform(df)
@@ -151,18 +159,92 @@ class RunInference(luigi.Task):
     model_path = luigi.Parameter()
     dataset_path = luigi.Parameter()
     output_path = luigi.Parameter()
+    feature_column = luigi.Parameter(default="tfidf")
+    system_name = luigi.Parameter(default="baseline")
+    k = luigi.IntParameter(default=1000)
+    memory = luigi.Parameter(default="10g")
+
+    @classmethod
+    def score_predictions(
+        cls, df, primary_key="DOCNO", k=1000, system_name="placeholder"
+    ):
+        target_probs = [c for c in df.columns if "_probability" in c]
+        target_probs_relevant = [vector_to_array(c)[1].alias(c) for c in target_probs]
+        # try to increase partitions to ease memory constraints
+        subset = df.select(primary_key, *target_probs_relevant).repartition(200).cache()
+        # now for each target, we can compute the most relevant documents
+        top_docs = []
+        for c in target_probs:
+            ordered = subset.select(
+                F.lit(int(c.split("_")[1])).alias("symptom_number"),
+                primary_key,
+                F.col(c).alias("score"),
+            )
+            top_docs.append(ordered)
+
+        # union all the documents together
+        return (
+            reduce(lambda a, b: a.union(b), top_docs)
+            .withColumn(
+                "rank",
+                F.row_number().over(
+                    Window.partitionBy("symptom_number").orderBy(F.col("score").desc())
+                ),
+            )
+            .where(F.col("rank") <= k)
+            .select(
+                "symptom_number",
+                F.lit("Q0").alias("Qo"),
+                F.col(primary_key).alias("sentence_id"),
+                F.col("rank").alias("position_in_ranking"),
+                "score",
+                F.lit(system_name).alias("system_name"),
+            )
+        )
+
+    def output(self):
+        return [
+            luigi.contrib.gcs.GCSTarget(f"{self.output_path}/predictions.csv"),
+            luigi.contrib.gcs.GCSTarget(
+                f"{self.output_path}/predictions_with_text.csv"
+            ),
+        ]
 
     def run(self):
-        with spark_resource() as spark:
-            model = spark.read.load(self.model_path)
-            df = spark.read.parquet(self.dataset_path)
+        with spark_resource(memory=self.memory) as spark:
+            model = PipelineModel.load(self.model_path)
+            df = spark.read.parquet(self.dataset_path).withColumn(
+                self.feature_column, array_to_vector(self.feature_column)
+            )
             predictions = model.transform(df)
+            predictions.printSchema()
+            scored = self.score_predictions(
+                predictions, k=self.k, system_name=self.system_name
+            ).cache()
+            # write the predictions to a csv file ready for submission
+            scored_pd = scored.toPandas()
+            scored_pd.to_csv(
+                f"{self.output_path}/predictions.csv",
+                index=False,
+            )
+
+            # also generate a human readable version of the predictions for debugging in csv
+            scored_with_text = (
+                df.select(F.col("DOCNO").alias("sentence_id"), F.col("TEXT").alias("text"))
+                .join(scored, "sentence_id", how="inner")
+                .toPandas()
+            )
+            scored_with_text.to_csv(
+                f"{self.output_path}/predictions_with_text.csv",
+                index=False,
+            )
 
 
 class Workflow(luigi.Task):
     train_labels_path = luigi.Parameter()
     dataset_path = luigi.Parameter()
     output_path = luigi.Parameter()
+    memory = luigi.IntParameter(default="10g")
 
     def run(self):
         yield TrainModel(
@@ -171,11 +253,12 @@ class Workflow(luigi.Task):
             model_path=f"{self.output_path}/model",
             eval_path=f"{self.output_path}/eval.json",
         )
-        # yield RunInference(
-        #     model_path=f"{self.output_path}/model",
-        #     dataset_path=self.dataset_path,
-        #     output_path=f"{self.output_path}/inference",
-        # )
+        yield RunInference(
+            model_path=f"{self.output_path}/model",
+            dataset_path=self.dataset_path,
+            output_path=f"{self.output_path}/inference",
+            memory=self.memory,
+        )
 
 
 if __name__ == "__main__":
