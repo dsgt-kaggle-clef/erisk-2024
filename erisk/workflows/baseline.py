@@ -1,28 +1,21 @@
-import luigi
-from erisk.utils import spark_resource
-from pyspark.sql import functions as F
-from pyspark.ml.functions import array_to_vector
-from pyspark.ml.classification import NaiveBayes
-from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.feature import (
-    MinMaxScaler,
-    Tokenizer,
-    HashingTF,
-    IDF,
-)
-from pyspark.ml.evaluation import MulticlassClassificationEvaluator
-import tqdm
-import luigi.contrib.gcs
 import json
-import numpy as np
+import os
 import time
-
-from pyspark.sql import functions as F, Window
-from pyspark.ml.functions import vector_to_array
 from functools import reduce
-from pyspark.ml import PipelineModel
-from pyspark.ml.functions import array_to_vector
+
+import luigi
+import luigi.contrib.gcs
+import numpy as np
+import tqdm
+from pyspark.ml import Pipeline, PipelineModel
+from pyspark.ml.classification import NaiveBayes
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml.feature import IDF, HashingTF, MinMaxScaler, Tokenizer
+from pyspark.ml.functions import array_to_vector, vector_to_array
+from pyspark.sql import Window
 from pyspark.sql import functions as F
+
+from erisk.utils import spark_resource
 
 
 class ProcessTFIDF(luigi.Task):
@@ -30,6 +23,7 @@ class ProcessTFIDF(luigi.Task):
     test_parquet_path = luigi.Parameter()
     output_path = luigi.Parameter()
     hashing_features = luigi.IntParameter(default=10_000)
+    num_partitions = luigi.IntParameter(default=500)
 
     def output(self):
         # save both the model pipeline and the dataset
@@ -81,14 +75,24 @@ class ProcessTFIDF(luigi.Task):
         return transformed
 
     def run(self):
-        with spark_resource() as spark:
-            df = self.load_parquet(
-                spark, self.train_parquet_path, self.test_parquet_path
-            ).cache()
+        with spark_resource(
+            **{
+                "spark.sql.shuffle.partitions": self.num_partitions,
+            },
+        ) as spark:
+            df = (
+                self.load_parquet(
+                    spark, self.train_parquet_path, self.test_parquet_path
+                )
+                .repartition(self.num_partitions)
+                .cache()
+            )
             model = self.pipeline().fit(df)
-            model = model.write().overwrite().save(f"{self.output_path}/model")
+            model.write().overwrite().save(f"{self.output_path}/model")
             transformed = self.transform(model, df, ["hashingtf", "tfidf"])
-            transformed.write.mode("overwrite").parquet(f"{self.output_path}/data")
+            transformed.repartition(self.num_partitions).write.mode(
+                "overwrite"
+            ).parquet(f"{self.output_path}/data")
 
         # now write the success file
         with self.output().open("w") as f:
@@ -237,7 +241,6 @@ class RunInference(luigi.Task):
     feature_column = luigi.Parameter(default="tfidf")
     system_name = luigi.Parameter(default="baseline")
     k = luigi.IntParameter(default=1000)
-    memory = luigi.Parameter(default="10g")
 
     @staticmethod
     def score_predictions(df, primary_key="docid", k=1000, system_name="placeholder"):
@@ -284,7 +287,7 @@ class RunInference(luigi.Task):
         ]
 
     def run(self):
-        with spark_resource(memory=self.memory) as spark:
+        with spark_resource() as spark:
             model = PipelineModel.load(self.model_path)
             df = spark.read.parquet(self.dataset_path).withColumn(
                 self.feature_column, array_to_vector(self.feature_column)
@@ -313,7 +316,7 @@ class RunInference(luigi.Task):
             )
             # and an abbreviated one where we only show the top 10 in json
             scored_with_text[scored_with_text.position_in_ranking <= 10].to_json(
-                f"{self.output_path}/predictions_with_text_top10.csv",
+                f"{self.output_path}/predictions_with_text_top10.json",
                 index=False,
                 orient="records",
             )
@@ -325,7 +328,6 @@ class Workflow(luigi.Task):
     train_labels_path = luigi.Parameter()
     dataset_path = luigi.Parameter()
     output_path = luigi.Parameter()
-    memory = luigi.IntParameter(default="10g")
 
     def run(self):
         yield ProcessTFIDF(
@@ -341,9 +343,8 @@ class Workflow(luigi.Task):
         )
         yield RunInference(
             model_path=f"{self.output_path}/model",
-            dataset_path=self.dataset_path,
+            dataset_path=f"{self.dataset_path}/data",
             output_path=f"{self.output_path}/inference",
-            memory=self.memory,
         )
 
 
