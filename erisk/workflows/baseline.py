@@ -10,28 +10,42 @@ import tqdm
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.classification import NaiveBayes
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
-from pyspark.ml.feature import IDF, HashingTF, MinMaxScaler, Tokenizer
+from pyspark.ml.feature import (
+    IDF,
+    HashingTF,
+    MinMaxScaler,
+    Tokenizer,
+    Word2Vec,
+    StopWordsRemover,
+    CountVectorizer,
+)
 from pyspark.ml.functions import array_to_vector, vector_to_array
-from pyspark.sql import Window
+from pyspark.sql import Window, DataFrame
 from pyspark.sql import functions as F
+from argparse import ArgumentParser
 
 from erisk.utils import spark_resource
 
 
-class ProcessTFIDF(luigi.Task):
+class ProcessBase(luigi.Task):
     train_parquet_path = luigi.Parameter()
     test_parquet_path = luigi.Parameter()
     output_path = luigi.Parameter()
-    hashing_features = luigi.IntParameter(default=10_000)
     num_partitions = luigi.IntParameter(default=500)
+    sample_data = luigi.BoolParameter(default=False)
+    sample_train_fraction = luigi.FloatParameter(default=0.001)
+    sample_test_fraction = luigi.FloatParameter(default=0.1)
 
     def output(self):
         # save both the model pipeline and the dataset
         return luigi.contrib.gcs.GCSTarget(f"{self.output_path}/_SUCCESS")
 
-    def load_parquet(self, spark, train_path, test_path):
+    def load_parquet(self, spark, train_path, test_path) -> DataFrame:
         train = spark.read.parquet(train_path)
         test = spark.read.parquet(test_path)
+        if self.sample_data:
+            train = train.sample(fraction=self.sample_train_fraction)
+            test = test.sample(fraction=self.sample_test_fraction)
         return (
             train.select(
                 F.col("DOCNO").alias("docid"),
@@ -58,17 +72,14 @@ class ProcessTFIDF(luigi.Task):
             .where("text is not null")
         )
 
-    def pipeline(self):
-        tokenizer = Tokenizer(inputCol="text", outputCol="words")
-        hashingTF = HashingTF(
-            inputCol=tokenizer.getOutputCol(),
-            outputCol="hashingtf",
-            numFeatures=self.hashing_features,
-        )
-        idf = IDF(inputCol=hashingTF.getOutputCol(), outputCol="tfidf")
-        return Pipeline(stages=[tokenizer, hashingTF, idf])
+    @property
+    def feature_columns(self) -> list:
+        raise NotImplementedError()
 
-    def transform(self, model, df, features):
+    def pipeline(self) -> Pipeline:
+        raise NotImplementedError()
+
+    def transform(self, model, df, features) -> DataFrame:
         transformed = model.transform(df)
         for c in features:
             transformed = transformed.withColumn(c, vector_to_array(F.col(c)))
@@ -76,9 +87,7 @@ class ProcessTFIDF(luigi.Task):
 
     def run(self):
         with spark_resource(
-            **{
-                "spark.sql.shuffle.partitions": self.num_partitions,
-            },
+            **{"spark.sql.shuffle.partitions": max(self.num_partitions, 200)}
         ) as spark:
             df = (
                 self.load_parquet(
@@ -89,7 +98,7 @@ class ProcessTFIDF(luigi.Task):
             )
             model = self.pipeline().fit(df)
             model.write().overwrite().save(f"{self.output_path}/model")
-            transformed = self.transform(model, df, ["hashingtf", "tfidf"])
+            transformed = self.transform(model, df, self.feature_columns)
             transformed.repartition(self.num_partitions).write.mode(
                 "overwrite"
             ).parquet(f"{self.output_path}/data")
@@ -99,7 +108,70 @@ class ProcessTFIDF(luigi.Task):
             f.write("")
 
 
-class TrainModel(luigi.Task):
+class ProcessCountTFIDF(ProcessBase):
+    vocab_size = luigi.IntParameter(default=10_000)
+
+    @property
+    def feature_columns(self):
+        return ["counttf", "tfidf"]
+
+    def pipeline(self):
+        tokenizer = Tokenizer(inputCol="text", outputCol="words")
+        remover = StopWordsRemover(
+            inputCol=tokenizer.getOutputCol(), outputCol="filtered_words"
+        )
+        count_vectorizer = CountVectorizer(
+            inputCol=remover.getOutputCol(),
+            outputCol="counttf",
+            minDF=5,
+            vocabSize=self.vocab_size,
+        )
+        idf = IDF(inputCol=count_vectorizer.getOutputCol(), outputCol="tfidf")
+        return Pipeline(stages=[tokenizer, remover, count_vectorizer, idf])
+
+
+class ProcessHashingTFIDF(ProcessBase):
+    hashing_features = luigi.IntParameter(default=10_000)
+
+    @property
+    def feature_columns(self):
+        return ["hashingtf", "tfidf"]
+
+    def pipeline(self):
+        tokenizer = Tokenizer(inputCol="text", outputCol="words")
+        remover = StopWordsRemover(
+            inputCol=tokenizer.getOutputCol(), outputCol="filtered_words"
+        )
+        hashingTF = HashingTF(
+            inputCol=remover.getOutputCol(),
+            outputCol="hashingtf",
+            numFeatures=self.hashing_features,
+        )
+        idf = IDF(inputCol=hashingTF.getOutputCol(), outputCol="tfidf")
+        return Pipeline(stages=[tokenizer, remover, hashingTF, idf])
+
+
+class ProcessWord2Vec(ProcessBase):
+    vector_size = luigi.IntParameter(default=256)
+
+    @property
+    def feature_columns(self):
+        return ["word2vec"]
+
+    def pipeline(self):
+        tokenizer = Tokenizer(inputCol="text", outputCol="words")
+        remover = StopWordsRemover(
+            inputCol=tokenizer.getOutputCol(), outputCol="filtered_words"
+        )
+        word2Vec = Word2Vec(
+            vectorSize=self.vector_size,
+            inputCol=remover.getOutputCol(),
+            outputCol="word2vec",
+        )
+        return Pipeline(stages=[tokenizer, remover, word2Vec])
+
+
+class TrainModelBase(luigi.Task):
     train_labels_path = luigi.Parameter()
     dataset_path = luigi.Parameter()
     model_path = luigi.Parameter()
@@ -178,23 +250,8 @@ class TrainModel(luigi.Task):
         print(f"Mean F1 Train: {mean_f1_train}")
         print(f"Mean Accuracy Train: {mean_accuracy_train}")
 
-    @staticmethod
-    def build_nb_model_pipeline(feature, targets):
-        pipeline = Pipeline(
-            stages=[MinMaxScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
-            + [
-                NaiveBayes(
-                    labelCol=target,
-                    featuresCol=f"{feature}_scaled",
-                    predictionCol=f"{target}_prediction",
-                    probabilityCol=f"{target}_probability",
-                    rawPredictionCol=f"{target}_raw",
-                    smoothing=1.0,
-                )
-                for target in targets
-            ]
-        )
-        return pipeline
+    def build_model_pipeline(self, feature, targets) -> Pipeline:
+        raise NotImplementedError()
 
     def output(self):
         return [
@@ -210,7 +267,7 @@ class TrainModel(luigi.Task):
                 [self.feature_column],
             ).cache()
             df.printSchema()
-            pipeline = self.build_nb_model_pipeline(
+            pipeline = self.build_model_pipeline(
                 self.feature_column, [c for c in df.columns if c.startswith("target_")]
             )
             model = pipeline.fit(df.where(f"sampleid < {self.train_percent}").fillna(0))
@@ -232,6 +289,25 @@ class TrainModel(luigi.Task):
             # retrain on the full dataset
             model = pipeline.fit(df.fillna(0))
             model.write().overwrite().save(self.model_path)
+
+
+class TrainNaiveBayesModel(TrainModelBase):
+    def build_model_pipeline(feature, targets):
+        pipeline = Pipeline(
+            stages=[MinMaxScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
+            + [
+                NaiveBayes(
+                    labelCol=target,
+                    featuresCol=f"{feature}_scaled",
+                    predictionCol=f"{target}_prediction",
+                    probabilityCol=f"{target}_probability",
+                    rawPredictionCol=f"{target}_raw",
+                    smoothing=1.0,
+                )
+                for target in targets
+            ]
+        )
+        return pipeline
 
 
 class RunInference(luigi.Task):
@@ -326,16 +402,36 @@ class Workflow(luigi.Task):
     train_parquet_path = luigi.Parameter()
     test_parquet_path = luigi.Parameter()
     train_labels_path = luigi.Parameter()
+    sample_data = luigi.BoolParameter(default=False)
+
+    processor = luigi.ChoiceParameter(choices=["count", "hashing", "word2vec"])
+    model = luigi.ChoiceParameter(choices=["nb"])
     dataset_path = luigi.Parameter()
     output_path = luigi.Parameter()
 
     def run(self):
-        yield ProcessTFIDF(
+        processors = {
+            "count": ProcessCountTFIDF,
+            "hashing": ProcessHashingTFIDF,
+            "word2vec": ProcessWord2Vec,
+        }
+        feature_columns = {
+            "count": "tfidf",
+            "hashing": "tfidf",
+            "word2vec": "word2vec",
+        }
+        models = {
+            "nb": TrainNaiveBayesModel,
+        }
+
+        yield processors[self.processor](
             train_parquet_path=self.train_parquet_path,
             test_parquet_path=self.test_parquet_path,
             output_path=self.dataset_path,
+            sample_data=self.sample_data,
+            num_partitions=32 if self.sample_data else 500,
         )
-        yield TrainModel(
+        yield models[self.model](
             train_labels_path=self.train_labels_path,
             dataset_path=f"{self.dataset_path}/data",
             model_path=f"{self.output_path}/model",
@@ -345,19 +441,43 @@ class Workflow(luigi.Task):
             model_path=f"{self.output_path}/model",
             dataset_path=f"{self.dataset_path}/data",
             output_path=f"{self.output_path}/inference",
+            feature_column=feature_columns[self.processor],
+            k=100 if self.sample_data else 1000,
         )
 
 
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument("--sample-data", action="store_true", default=False)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    base_uri = "gs://dsgt-clef-erisk-2024/task1"
+    inputs = dict(
+        train_parquet_path=f"{base_uri}/parquet/train",
+        test_parquet_path=f"{base_uri}/parquet/test",
+        train_labels_path=f"{base_uri}/training/t1_training/TRAINING DATA (2023 COLLECTION)/g_rels_consenso.csv",
+    )
+    version = "v3"
+    if args.sample_data:
+        version = f"{version}_sample"
     luigi.build(
         [
             Workflow(
-                train_parquet_path="gs://dsgt-clef-erisk-2024/task1/parquet/train",
-                test_parquet_path="gs://dsgt-clef-erisk-2024/task1/parquet/test",
-                train_labels_path="gs://dsgt-clef-erisk-2024/task1/training/t1_training/TRAINING DATA (2023 COLLECTION)/g_rels_consenso.csv",
-                dataset_path="gs://dsgt-clef-erisk-2024/task1/parquet/tfidf/v2",
-                output_path="gs://dsgt-clef-erisk-2024/task1/processed/baseline_nb_tfidf/v2",
+                sample_data=args.sample_data,
+                dataset_path=f"{base_uri}/processed/data/{processor}/{version}",
+                output_path=f"{base_uri}/processed/eval/{model}_{processor}/{version}",
+                processor=processor,
+                model=model,
+                **inputs,
             )
+            for (processor, model) in [
+                ("count", "nb"),
+                ("hashing", "nb"),
+                ("word2vec", "nb"),
+            ]
         ],
         scheduler_host="services.us-central1-a.c.dsgt-clef-2024.internal",
     )
