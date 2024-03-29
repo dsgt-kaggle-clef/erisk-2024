@@ -1,19 +1,20 @@
 import json
-import os
 import time
 from functools import reduce
+import os
 
 import luigi
 import luigi.contrib.gcs
 import numpy as np
 import tqdm
 from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.classification import NaiveBayes
+from pyspark.ml.classification import NaiveBayes, LogisticRegression, FMClassifier
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.ml.feature import (
     IDF,
     HashingTF,
     MinMaxScaler,
+    StandardScaler,
     Tokenizer,
     Word2Vec,
     StopWordsRemover,
@@ -167,6 +168,7 @@ class ProcessWord2Vec(ProcessBase):
             vectorSize=self.vector_size,
             inputCol=remover.getOutputCol(),
             outputCol="word2vec",
+            numPartitions=16,
         )
         return Pipeline(stages=[tokenizer, remover, word2Vec])
 
@@ -199,7 +201,9 @@ class TrainModelBase(luigi.Task):
 
     @staticmethod
     def load_dataset(spark, train_labels_path, dataset_path):
-        labels = spark.read.csv(train_labels_path, header=True, inferSchema=True)
+        labels = spark.read.csv(
+            train_labels_path, header=True, inferSchema=True
+        ).repartition(16)
         dataset = spark.read.parquet(dataset_path)
         return dataset.join(labels, "docid", how="inner")
 
@@ -292,7 +296,7 @@ class TrainModelBase(luigi.Task):
 
 
 class TrainNaiveBayesModel(TrainModelBase):
-    def build_model_pipeline(feature, targets):
+    def build_model_pipeline(self, feature, targets):
         pipeline = Pipeline(
             stages=[MinMaxScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
             + [
@@ -303,6 +307,42 @@ class TrainNaiveBayesModel(TrainModelBase):
                     probabilityCol=f"{target}_probability",
                     rawPredictionCol=f"{target}_raw",
                     smoothing=1.0,
+                )
+                for target in targets
+            ]
+        )
+        return pipeline
+
+
+class TrainLogisticRegressionModel(TrainModelBase):
+    def build_model_pipeline(self, feature, targets):
+        pipeline = Pipeline(
+            stages=[StandardScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
+            + [
+                LogisticRegression(
+                    labelCol=target,
+                    featuresCol=f"{feature}_scaled",
+                    predictionCol=f"{target}_prediction",
+                    probabilityCol=f"{target}_probability",
+                    rawPredictionCol=f"{target}_raw",
+                )
+                for target in targets
+            ]
+        )
+        return pipeline
+
+
+class TrainFMModel(TrainModelBase):
+    def build_model_pipeline(self, feature, targets):
+        pipeline = Pipeline(
+            stages=[MinMaxScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
+            + [
+                FMClassifier(
+                    labelCol=target,
+                    featuresCol=f"{feature}_scaled",
+                    predictionCol=f"{target}_prediction",
+                    probabilityCol=f"{target}_probability",
+                    rawPredictionCol=f"{target}_raw",
                 )
                 for target in targets
             ]
@@ -405,7 +445,7 @@ class Workflow(luigi.Task):
     sample_data = luigi.BoolParameter(default=False)
 
     processor = luigi.ChoiceParameter(choices=["count", "hashing", "word2vec"])
-    model = luigi.ChoiceParameter(choices=["nb"])
+    model = luigi.ChoiceParameter(choices=["nb", "logistic", "fm"])
     dataset_path = luigi.Parameter()
     output_path = luigi.Parameter()
 
@@ -422,6 +462,8 @@ class Workflow(luigi.Task):
         }
         models = {
             "nb": TrainNaiveBayesModel,
+            "logistic": TrainLogisticRegressionModel,
+            "fm": TrainFMModel,
         }
 
         yield processors[self.processor](
@@ -477,6 +519,12 @@ if __name__ == "__main__":
                 ("count", "nb"),
                 ("hashing", "nb"),
                 ("word2vec", "nb"),
+                ("count", "logistic"),
+                # ("hashing", "logistic"),
+                ("word2vec", "logistic"),
+                ("count", "fm"),
+                # ("hashing", "fm"),
+                ("word2vec", "fm"),
             ]
         ],
         scheduler_host="services.us-central1-a.c.dsgt-clef-2024.internal",
