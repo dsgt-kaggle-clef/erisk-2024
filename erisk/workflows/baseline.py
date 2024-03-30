@@ -176,10 +176,11 @@ class ProcessWord2Vec(ProcessBase):
 class TrainModelBase(luigi.Task):
     train_labels_path = luigi.Parameter()
     dataset_path = luigi.Parameter()
+    feature_column = luigi.Parameter()
+
     model_path = luigi.Parameter()
     eval_path = luigi.Parameter()
     train_percent = luigi.FloatParameter(default=80)
-    feature_column = luigi.Parameter(default="tfidf")
 
     @staticmethod
     def pivot_training(df, feature_columns, target_prefix="target_"):
@@ -205,6 +206,8 @@ class TrainModelBase(luigi.Task):
             train_labels_path, header=True, inferSchema=True
         ).repartition(16)
         dataset = spark.read.parquet(dataset_path)
+        labels.printSchema()
+        dataset.printSchema()
         return dataset.join(labels, "docid", how="inner")
 
     @staticmethod
@@ -314,6 +317,36 @@ class TrainNaiveBayesModel(TrainModelBase):
         return pipeline
 
 
+class TrainLoopyBayesModel(TrainModelBase):
+    def build_model_pipeline(self, feature, targets):
+        pipeline = Pipeline(
+            stages=[MinMaxScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
+            + [
+                NaiveBayes(
+                    labelCol=target,
+                    featuresCol=f"{feature}_scaled",
+                    predictionCol=f"{target}_prediction_prior",
+                    probabilityCol=f"{target}_probability_prior",
+                    rawPredictionCol=f"{target}_raw_prior",
+                    smoothing=1.0,
+                )
+                for target in targets
+            ]
+            + [
+                NaiveBayes(
+                    labelCol=f"{target}_prediction_prior",
+                    featuresCol=f"{feature}_scaled",
+                    predictionCol=f"{target}_prediction",
+                    probabilityCol=f"{target}_probability",
+                    rawPredictionCol=f"{target}_raw",
+                    smoothing=1.0,
+                )
+                for target in targets
+            ]
+        )
+        return pipeline
+
+
 class TrainLogisticRegressionModel(TrainModelBase):
     def build_model_pipeline(self, feature, targets):
         pipeline = Pipeline(
@@ -357,21 +390,29 @@ class RunInference(luigi.Task):
     feature_column = luigi.Parameter(default="tfidf")
     system_name = luigi.Parameter(default="baseline")
     k = luigi.IntParameter(default=1000)
+    shuffle_partitions = luigi.IntParameter(default=400)
 
     @staticmethod
-    def score_predictions(df, primary_key="docid", k=1000, system_name="placeholder"):
-        target_probs = [c for c in df.columns if "_probability" in c]
+    def materialize_predictions(spark, output, df, primary_key="docid"):
+        target_probs = [c for c in df.columns if c.endswith("_probability")]
         target_probs_relevant = [vector_to_array(c)[1].alias(c) for c in target_probs]
-        # try to increase partitions to ease memory constraints
-        subset = df.select(primary_key, *target_probs_relevant).repartition(200).cache()
+        subset = df.select(primary_key, *target_probs_relevant)
+        subset.write.mode("overwrite").parquet(output)
+        return spark.read.parquet(output)
+
+    @staticmethod
+    def score_predictions(
+        predictions, primary_key="docid", k=1000, system_name="placeholder"
+    ):
         # now for each target, we can compute the most relevant documents
+        target_probs = [c for c in predictions.columns if c.endswith("_probability")]
         top_docs = []
         for c in target_probs:
-            ordered = subset.select(
+            ordered = predictions.select(
                 F.lit(int(c.split("_")[1])).alias("symptom_number"),
                 primary_key,
                 F.col(c).alias("score"),
-            )
+            ).where(F.col("score") > 0.7)
             top_docs.append(ordered)
 
         # union all the documents together
@@ -380,7 +421,7 @@ class RunInference(luigi.Task):
             .withColumn(
                 "rank",
                 F.row_number().over(
-                    Window.partitionBy("symptom_number").orderBy(F.col("score").desc())
+                    Window.partitionBy("symptom_number").orderBy(F.desc("score"))
                 ),
             )
             .where(F.col("rank") <= k)
@@ -403,16 +444,35 @@ class RunInference(luigi.Task):
         ]
 
     def run(self):
-        with spark_resource() as spark:
+        with spark_resource(
+            **{
+                "spark.sql.shuffle.partitions": self.shuffle_partitions,
+                # count vectors can be too big
+                "spark.sql.parquet.enableVectorizedReader": False,
+            }
+        ) as spark:
             model = PipelineModel.load(self.model_path)
-            df = spark.read.parquet(self.dataset_path).withColumn(
-                self.feature_column, array_to_vector(self.feature_column)
+            df = (
+                spark.read.parquet(self.dataset_path)
+                .repartition(self.shuffle_partitions)
+                .withColumn(self.feature_column, array_to_vector(self.feature_column))
             )
             predictions = model.transform(df)
             predictions.printSchema()
+
+            # materialize a subset of predictions that we care about
+            predictions = self.materialize_predictions(
+                spark, f"{self.output_path}/predictions", predictions
+            ).cache()
+            predictions.printSchema()
+
             scored = self.score_predictions(
                 predictions, k=self.k, system_name=self.system_name
-            ).cache()
+            )
+            # write to parquet
+            scored.write.mode("overwrite").parquet(f"{self.output_path}/data")
+            scored = spark.read.parquet(f"{self.output_path}/data")
+
             # write the predictions to a csv file ready for submission
             scored_pd = scored.toPandas()
             scored_pd.to_csv(
@@ -445,7 +505,7 @@ class Workflow(luigi.Task):
     sample_data = luigi.BoolParameter(default=False)
 
     processor = luigi.ChoiceParameter(choices=["count", "hashing", "word2vec"])
-    model = luigi.ChoiceParameter(choices=["nb", "logistic", "fm"])
+    model = luigi.ChoiceParameter(choices=["nb", "logistic", "fm", "loopy_nb"])
     dataset_path = luigi.Parameter()
     output_path = luigi.Parameter()
 
@@ -464,6 +524,7 @@ class Workflow(luigi.Task):
             "nb": TrainNaiveBayesModel,
             "logistic": TrainLogisticRegressionModel,
             "fm": TrainFMModel,
+            "loopy_nb": TrainLoopyBayesModel,
         }
 
         yield processors[self.processor](
@@ -478,6 +539,7 @@ class Workflow(luigi.Task):
             dataset_path=f"{self.dataset_path}/data",
             model_path=f"{self.output_path}/model",
             eval_path=f"{self.output_path}/eval.json",
+            feature_column=feature_columns[self.processor],
         )
         yield RunInference(
             model_path=f"{self.output_path}/model",
@@ -518,12 +580,11 @@ if __name__ == "__main__":
             for (processor, model) in [
                 ("count", "nb"),
                 ("hashing", "nb"),
-                ("word2vec", "nb"),
+                ("count", "loopy_nb"),
+                # ("word2vec", "nb"), # must be non-negative
                 ("count", "logistic"),
-                # ("hashing", "logistic"),
                 ("word2vec", "logistic"),
                 ("count", "fm"),
-                # ("hashing", "fm"),
                 ("word2vec", "fm"),
             ]
         ],
