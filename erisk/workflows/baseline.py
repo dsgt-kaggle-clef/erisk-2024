@@ -628,6 +628,9 @@ class Workflow(luigi.Task):
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--sample-data", action="store_true", default=False)
+    parser.add_argument(
+        "--scheduler-host", default="services.us-central1-a.c.dsgt-clef-2024.internal"
+    )
     return parser.parse_args()
 
 
@@ -665,5 +668,5 @@ if __name__ == "__main__":
                 ("transformer", "fm"),
             ]
         ],
-        scheduler_host="services.us-central1-a.c.dsgt-clef-2024.internal",
+        scheduler_host=args.scheduler_host,
     )
