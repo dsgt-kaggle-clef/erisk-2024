@@ -85,6 +85,9 @@ class ProcessBase(luigi.Task):
     def transform(self, model, df, features) -> DataFrame:
         transformed = model.transform(df)
         for c in features:
+            # check if the feature is a vector and convert it to an array
+            if "array" in transformed.schema[c].simpleString():
+                continue
             transformed = transformed.withColumn(c, vector_to_array(F.col(c)))
         return transformed
 
