@@ -665,7 +665,7 @@ if __name__ == "__main__":
                 ("transformer", "logistic"),
                 ("count", "fm"),
                 ("word2vec", "fm"),
-                ("transformer", "fm"),
+                # ("transformer", "fm"),
             ]
         ],
         scheduler_host=args.scheduler_host,
