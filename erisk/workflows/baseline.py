@@ -19,6 +19,7 @@ from pyspark.ml.feature import (
     Word2Vec,
     StopWordsRemover,
     CountVectorizer,
+    SQLTransformer,
 )
 from pyspark.ml.functions import array_to_vector, vector_to_array
 from pyspark.sql import Window, DataFrame
@@ -277,7 +278,7 @@ class TrainModelBase(luigi.Task):
             pipeline = self.build_model_pipeline(
                 self.feature_column, [c for c in df.columns if c.startswith("target_")]
             )
-            model = pipeline.fit(df.where(f"sampleid < {self.train_percent}").fillna(0))
+            model = pipeline.fit(df.where(f"sampleid < {self.train_percent}"))
             predictions = model.transform(df)
 
             # run the evaluation
@@ -294,7 +295,7 @@ class TrainModelBase(luigi.Task):
             )
 
             # retrain on the full dataset
-            model = pipeline.fit(df.fillna(0))
+            model = pipeline.fit(df)
             model.write().overwrite().save(self.model_path)
 
 
@@ -303,8 +304,15 @@ class TrainNaiveBayesModel(TrainModelBase):
         pipeline = Pipeline(
             stages=[MinMaxScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
             + [
+                # coalesce nulls to 0
+                SQLTransformer(
+                    statement=f"SELECT *, COALESCE({c}, 0) as {c}_init FROM __THIS__"
+                )
+                for c in targets
+            ]
+            + [
                 NaiveBayes(
-                    labelCol=target,
+                    labelCol=f"{target}_init",
                     featuresCol=f"{feature}_scaled",
                     predictionCol=f"{target}_prediction",
                     probabilityCol=f"{target}_probability",
@@ -322,8 +330,15 @@ class TrainLoopyBayesModel(TrainModelBase):
         pipeline = Pipeline(
             stages=[MinMaxScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
             + [
+                # coalesce nulls to 0
+                SQLTransformer(
+                    statement=f"SELECT *, COALESCE({c}, 0) as {c}_init FROM __THIS__"
+                )
+                for c in targets
+            ]
+            + [
                 NaiveBayes(
-                    labelCol=target,
+                    labelCol=f"{target}_init",
                     featuresCol=f"{feature}_scaled",
                     predictionCol=f"{target}_prediction_prior",
                     probabilityCol=f"{target}_probability_prior",
@@ -333,8 +348,15 @@ class TrainLoopyBayesModel(TrainModelBase):
                 for target in targets
             ]
             + [
+                # coalesce nulls to 0
+                SQLTransformer(
+                    statement=f"SELECT *, COALESCE({c}, {c}_prediction_prior) as {c}_prior FROM __THIS__"
+                )
+                for c in targets
+            ]
+            + [
                 NaiveBayes(
-                    labelCol=f"{target}_prediction_prior",
+                    labelCol=f"{target}_prior",
                     featuresCol=f"{feature}_scaled",
                     predictionCol=f"{target}_prediction",
                     probabilityCol=f"{target}_probability",
@@ -352,8 +374,15 @@ class TrainLogisticRegressionModel(TrainModelBase):
         pipeline = Pipeline(
             stages=[StandardScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
             + [
+                # coalesce nulls to 0
+                SQLTransformer(
+                    statement=f"SELECT *, COALESCE({c}, 0) as {c}_init FROM __THIS__"
+                )
+                for c in targets
+            ]
+            + [
                 LogisticRegression(
-                    labelCol=target,
+                    labelCol=f"{target}_init",
                     featuresCol=f"{feature}_scaled",
                     predictionCol=f"{target}_prediction",
                     probabilityCol=f"{target}_probability",
@@ -370,8 +399,14 @@ class TrainFMModel(TrainModelBase):
         pipeline = Pipeline(
             stages=[MinMaxScaler(inputCol=feature, outputCol=f"{feature}_scaled")]
             + [
+                SQLTransformer(
+                    statement=f"SELECT *, COALESCE({c}, 0) as {c}_init FROM __THIS__"
+                )
+                for c in targets
+            ]
+            + [
                 FMClassifier(
-                    labelCol=target,
+                    labelCol=f"{target}_init",
                     featuresCol=f"{feature}_scaled",
                     predictionCol=f"{target}_prediction",
                     probabilityCol=f"{target}_probability",
@@ -391,6 +426,13 @@ class RunInference(luigi.Task):
     system_name = luigi.Parameter(default="baseline")
     k = luigi.IntParameter(default=1000)
     shuffle_partitions = luigi.IntParameter(default=400)
+
+    @staticmethod
+    def add_null_targets(df):
+        # add a bunch of target columns
+        for i in range(22):
+            df = df.withColumn(f"target_{i}", F.lit(None).cast("double"))
+        return df
 
     @staticmethod
     def materialize_predictions(spark, output, df, primary_key="docid"):
@@ -457,7 +499,12 @@ class RunInference(luigi.Task):
                 .repartition(self.shuffle_partitions)
                 .withColumn(self.feature_column, array_to_vector(self.feature_column))
             )
-            predictions = model.transform(df)
+            # Note that we have to add dummy null targets to the dataset even when we do
+            # inference, because our model expects them in the sql transforms. This is 
+            # an unfortunate side effect of the way we've structured the pipeline, and
+            # if this were to be done again, we would probably refactor the pipeline to
+            # avoid this situation.
+            predictions = model.transform(self.add_null_targets(df))
             predictions.printSchema()
 
             # materialize a subset of predictions that we care about
@@ -565,14 +612,15 @@ if __name__ == "__main__":
         train_labels_path=f"{base_uri}/training/t1_training/TRAINING DATA (2023 COLLECTION)/g_rels_consenso.csv",
     )
     version = "v3"
+    name = "eval"
     if args.sample_data:
-        version = f"{version}_sample"
+        name = f"{name}_sample"
     luigi.build(
         [
             Workflow(
                 sample_data=args.sample_data,
                 dataset_path=f"{base_uri}/processed/data/{processor}/{version}",
-                output_path=f"{base_uri}/processed/eval/{model}_{processor}/{version}",
+                output_path=f"{base_uri}/processed/{name}/{model}_{processor}/{version}",
                 processor=processor,
                 model=model,
                 **inputs,
