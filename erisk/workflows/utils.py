@@ -34,7 +34,12 @@ class WrappedSentenceTransformer(
         """Return PredictBatchFunction using a closure over the model"""
         from sentence_transformers import SentenceTransformer
 
-        return SentenceTransformer(self.model_name).encode
+        model = SentenceTransformer(self.model_name)
+
+        def predict(inputs: np.ndarray) -> np.ndarray:
+            return model.encode(inputs)
+
+        return predict
 
     def _transform(self, df: DataFrame):
         return df.withColumn(
