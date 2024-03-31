@@ -1,10 +1,10 @@
+import numpy as np
 from pyspark.ml import Transformer
+from pyspark.ml.functions import predict_batch_udf
 from pyspark.ml.param.shared import HasInputCol, HasOutputCol
 from pyspark.ml.util import DefaultParamsReadable, DefaultParamsWritable
 from pyspark.sql import DataFrame
 from pyspark.sql.types import ArrayType, FloatType
-import numpy as np
-from pyspark.ml.functions import predict_batch_udf
 
 
 class WrappedSentenceTransformer(

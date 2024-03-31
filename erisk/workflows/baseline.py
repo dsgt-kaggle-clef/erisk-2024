@@ -1,30 +1,31 @@
 import json
-import time
-from functools import reduce
 import os
+import time
+from argparse import ArgumentParser
+from functools import reduce
 
 import luigi
 import luigi.contrib.gcs
 import numpy as np
+import pandas as pd
 import tqdm
 from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.classification import NaiveBayes, LogisticRegression, FMClassifier
+from pyspark.ml.classification import FMClassifier, LogisticRegression, NaiveBayes
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.ml.feature import (
     IDF,
+    CountVectorizer,
     HashingTF,
     MinMaxScaler,
+    SQLTransformer,
     StandardScaler,
+    StopWordsRemover,
     Tokenizer,
     Word2Vec,
-    StopWordsRemover,
-    CountVectorizer,
-    SQLTransformer,
 )
 from pyspark.ml.functions import array_to_vector, vector_to_array
-from pyspark.sql import Window, DataFrame
+from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
-from argparse import ArgumentParser
 
 from erisk.utils import spark_resource
 from erisk.workflows.utils import WrappedSentenceTransformer
@@ -570,6 +571,25 @@ class RunInference(luigi.Task):
             )
 
 
+class FormatTrec(luigi.Task):
+    input_path = luigi.Parameter()
+    output_path = luigi.Parameter()
+    system_name = luigi.Parameter(default="baseline")
+
+    def output(self):
+        return luigi.contrib.gcs.GCSTarget(self.output_path)
+
+    def run(self):
+        df = pd.read_csv(self.input_path)
+        df.sort_values(["symptom_number", "position_in_ranking"]).rename(
+            columns=dict(Qo="Q0")
+        )
+        # replace the system name if necessary
+        df["system_name"] = self.system_name
+        # write as a tab-separated file
+        df.to_csv(self.output_path, sep="\t", index=False)
+
+
 class Workflow(luigi.Task):
     train_parquet_path = luigi.Parameter()
     test_parquet_path = luigi.Parameter()
@@ -622,6 +642,11 @@ class Workflow(luigi.Task):
             output_path=f"{self.output_path}/inference",
             feature_column=feature_columns[self.processor],
             k=100 if self.sample_data else 1000,
+        )
+        yield FormatTrec(
+            input_path=f"{self.output_path}/inference/predictions.csv",
+            output_path=f"{self.output_path}/inference/predictions.trec",
+            system_name=f"{self.processor}_{self.model}",
         )
 
 
