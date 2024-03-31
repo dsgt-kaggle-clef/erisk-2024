@@ -27,6 +27,7 @@ from pyspark.sql import functions as F
 from argparse import ArgumentParser
 
 from erisk.utils import spark_resource
+from erisk.workflows.utils import WrappedSentenceTransformer
 
 
 class ProcessBase(luigi.Task):
@@ -172,6 +173,27 @@ class ProcessWord2Vec(ProcessBase):
             numPartitions=16,
         )
         return Pipeline(stages=[tokenizer, remover, word2Vec])
+
+
+class ProcessSentenceTransformer(ProcessBase):
+    model_name = luigi.Parameter(default="all-MiniLM-L6-v2")
+    batch_size = luigi.IntParameter(default=8)
+
+    @property
+    def feature_columns(self):
+        return ["embedding"]
+
+    def pipeline(self):
+        return Pipeline(
+            stages=[
+                WrappedSentenceTransformer(
+                    input_col="text",
+                    output_col="embedding",
+                    model_name=self.model_name,
+                    batch_size=self.batch_size,
+                )
+            ]
+        )
 
 
 class TrainModelBase(luigi.Task):
@@ -500,7 +522,7 @@ class RunInference(luigi.Task):
                 .withColumn(self.feature_column, array_to_vector(self.feature_column))
             )
             # Note that we have to add dummy null targets to the dataset even when we do
-            # inference, because our model expects them in the sql transforms. This is 
+            # inference, because our model expects them in the sql transforms. This is
             # an unfortunate side effect of the way we've structured the pipeline, and
             # if this were to be done again, we would probably refactor the pipeline to
             # avoid this situation.
@@ -551,7 +573,9 @@ class Workflow(luigi.Task):
     train_labels_path = luigi.Parameter()
     sample_data = luigi.BoolParameter(default=False)
 
-    processor = luigi.ChoiceParameter(choices=["count", "hashing", "word2vec"])
+    processor = luigi.ChoiceParameter(
+        choices=["count", "hashing", "word2vec", "transformer"]
+    )
     model = luigi.ChoiceParameter(choices=["nb", "logistic", "fm", "loopy_nb"])
     dataset_path = luigi.Parameter()
     output_path = luigi.Parameter()
@@ -561,6 +585,7 @@ class Workflow(luigi.Task):
             "count": ProcessCountTFIDF,
             "hashing": ProcessHashingTFIDF,
             "word2vec": ProcessWord2Vec,
+            "transformer": ProcessSentenceTransformer,
         }
         feature_columns = {
             "count": "tfidf",
@@ -612,15 +637,14 @@ if __name__ == "__main__":
         train_labels_path=f"{base_uri}/training/t1_training/TRAINING DATA (2023 COLLECTION)/g_rels_consenso.csv",
     )
     version = "v3"
-    name = "eval"
-    if args.sample_data:
-        name = f"{name}_sample"
+    suffix = "" if not args.sample_data else "_sample"
+
     luigi.build(
         [
             Workflow(
                 sample_data=args.sample_data,
-                dataset_path=f"{base_uri}/processed/data/{processor}/{version}",
-                output_path=f"{base_uri}/processed/{name}/{model}_{processor}/{version}",
+                dataset_path=f"{base_uri}/processed/data/{processor}{suffix}/{version}",
+                output_path=f"{base_uri}/processed/eval{suffix}/{model}_{processor}/{version}",
                 processor=processor,
                 model=model,
                 **inputs,
@@ -632,8 +656,10 @@ if __name__ == "__main__":
                 # ("word2vec", "nb"), # must be non-negative
                 ("count", "logistic"),
                 ("word2vec", "logistic"),
+                ("transformer", "logistic"),
                 ("count", "fm"),
                 ("word2vec", "fm"),
+                ("transformer", "fm"),
             ]
         ],
         scheduler_host="services.us-central1-a.c.dsgt-clef-2024.internal",
