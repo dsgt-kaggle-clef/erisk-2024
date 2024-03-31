@@ -1,0 +1,85 @@
+BDIQID,QRANK,QTEXT
+1,0,I do not feel sad.
+1,1,I feel sad
+1,2,I am sad all the time and I can't snap out of it.
+1,3,I am so sad and unhappy that I can't stand it.
+2,0,I am not particularly discouraged about the future.
+2,1,I feel discouraged about the future.
+2,2,I feel I have nothing to look forward to.
+2,3,I feel the future is hopeless and that things cannot improve.
+3,0,I do not feel like a failure.
+3,1,I feel I have failed more than the average person.
+3,2,"As I look back on my life, all I can see is alot of failures."
+3,3,I feel I am a complete failure as a person.
+4,0,I get as much satisfaction out of things as I used to.
+4,1,I don't enjoy things the way I used to.
+4,2,I don't get real satisfaction out of anything anymore.
+4,3,I am dissatisfied or bored with everything.
+5,0,I don't feel particularly guilty
+5,1,I feel guilty a good part of the time.
+5,2,I feel quite guilty most of the time.
+5,3,I feel guilty all of the time.
+6,0,I don't feel I am being punished.
+6,1,I feel I may be punished.
+6,2,I expect to be punished.
+6,3,I feel I am being punished.
+7,0,I don't feel disappointed in myself.
+7,1,I am disappointed in myself.
+7,2,I am disgusted with myself.
+7,3,I hate myself.
+8,0,I don't feel I am any worse than anybody else.
+8,1,I am critical of myself for my weaknesses or mistakes.
+8,2,I blame myself all the time for my faults.
+8,3,I blame myself for everything bad that happens.
+9,0,I don't have any thoughts of killing myself.
+9,1,"I have thoughts of killing myself, but I would not carry them out."
+9,2,I would like to kill myself.
+9,3,I would kill myself if I had the chance.
+10,0,I don't cry any more than usual.
+10,1,I cry more now than I used to.
+10,2,I cry all the time now.
+10,3,"I used to be able to cry, but now I can't cry even though I want to."
+11,0,I am no more irritated by things than I ever was.
+11,1,I am slightly more irritated now than usual.
+11,2,I am quite annoyed or irritated a good deal of the time.
+11,3,I feel irritated all the time.
+12,0,I have not lost interest in other people.
+12,1,I am less interested in other people than I used to be.
+12,2,I have lost most of my interest in other people.
+12,3,I have lost all of my interest in other people.
+13,0,I make decisions about as well as I ever could.
+13,1,I put off making decisions more than I used to.
+13,2,I have greater difficulty in making decisions more than I used to.
+13,3,I can't make decisions at all anymore.
+14,0,I don't feel that I look any worse than I used to.
+14,1,I am worried that I am looking old or unattractive.
+14,2,I feel there are permanent changes in my appearance that make me look unattractive
+14,3,I believe that I look ugly.
+15,0,I can work about as well as before.
+15,1,I t takes an extra effort to get started at doing something.
+15,2,I have to push myself very hard to do anything.
+15,3,I can't do any work at all.
+16,0,I can sleep as well as usual.
+16,1,I don't sleep as well as I used to.
+16,2,I wake up 1-2 hours earlier than usual and find it hard to get back to sleep.
+16,3,I wake up several hours earlier than I used to and cannot get back to sleep.
+17,0,I don't get more tired than usual.
+17,1,I get tired more easily than I used to.
+17,2,I get tired from doing almost anything.
+17,3,I am too tired to do anything.
+18,0,My appetite is no worse than usual.
+18,1,My appetite is not as good as it used to be.
+18,2,My appetite is much worse now.
+18,3,I have no appetite at all anymore.
+19,0,"I haven't lost much weight, if any, lately."
+19,1,I have lost more than five pounds.
+19,2,I have lost more than ten pounds.
+19,3,I have lost more than fifteen pounds.
+20,0,I am no more worried about my health than usual.
+20,1,"I am worried about physical problems like aches, pains, upset stomach, or constipation."
+20,2,I am very worried about physical problems andit's hard to think of much else.
+20,3,I am so worried about my physical problems that I cannot think of anything else.
+21,0,I have not noticed any recent change in my interest in sex.
+21,1,I am less interested in sex than I used to be.
+21,2,I have almost no interest in sex.
+21,3,I have lost interest in sex completely.
