@@ -428,6 +428,13 @@ class RunInference(luigi.Task):
     shuffle_partitions = luigi.IntParameter(default=400)
 
     @staticmethod
+    def add_null_targets(df):
+        # add a bunch of target columns
+        for i in range(22):
+            df = df.withColumn(f"target_{i}", F.lit(None).cast("double"))
+        return df
+
+    @staticmethod
     def materialize_predictions(spark, output, df, primary_key="docid"):
         target_probs = [c for c in df.columns if c.endswith("_probability")]
         target_probs_relevant = [vector_to_array(c)[1].alias(c) for c in target_probs]
@@ -492,7 +499,12 @@ class RunInference(luigi.Task):
                 .repartition(self.shuffle_partitions)
                 .withColumn(self.feature_column, array_to_vector(self.feature_column))
             )
-            predictions = model.transform(df)
+            # Note that we have to add dummy null targets to the dataset even when we do
+            # inference, because our model expects them in the sql transforms. This is 
+            # an unfortunate side effect of the way we've structured the pipeline, and
+            # if this were to be done again, we would probably refactor the pipeline to
+            # avoid this situation.
+            predictions = model.transform(self.add_null_targets(df))
             predictions.printSchema()
 
             # materialize a subset of predictions that we care about
