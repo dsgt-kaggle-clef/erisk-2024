@@ -1,8 +1,8 @@
 import json
-import os
 import time
 from argparse import ArgumentParser
 from functools import reduce
+from pathlib import Path
 
 import luigi
 import luigi.contrib.gcs
@@ -179,27 +179,6 @@ class ProcessWord2Vec(ProcessBase):
         return Pipeline(stages=[tokenizer, remover, word2Vec])
 
 
-class ProcessSentenceTransformer(ProcessBase):
-    model_name = luigi.Parameter(default="all-MiniLM-L6-v2")
-    batch_size = luigi.IntParameter(default=8)
-
-    @property
-    def feature_columns(self):
-        return ["embedding"]
-
-    def pipeline(self):
-        return Pipeline(
-            stages=[
-                WrappedSentenceTransformer(
-                    input_col="text",
-                    output_col="embedding",
-                    model_name=self.model_name,
-                    batch_size=self.batch_size,
-                )
-            ]
-        )
-
-
 class TrainModelBase(luigi.Task):
     train_labels_path = luigi.Parameter()
     dataset_path = luigi.Parameter()
@@ -288,9 +267,14 @@ class TrainModelBase(luigi.Task):
         raise NotImplementedError()
 
     def output(self):
+        target = (
+            luigi.contrib.gcs.GCSTarget
+            if self.model_path.startswith("gs")
+            else luigi.LocalTarget
+        )
         return [
-            luigi.contrib.gcs.GCSTarget(self.model_path),
-            luigi.contrib.gcs.GCSTarget(self.eval_path),
+            target(self.model_path),
+            target(self.eval_path),
         ]
 
     def run(self):
@@ -301,6 +285,7 @@ class TrainModelBase(luigi.Task):
                 [self.feature_column],
             ).cache()
             df.printSchema()
+            print(f"row count: {df.count()}")
             pipeline = self.build_model_pipeline(
                 self.feature_column, [c for c in df.columns if c.startswith("target_")]
             )
@@ -314,11 +299,14 @@ class TrainModelBase(luigi.Task):
             total_seconds = time.time() - start_time
             results["time"] = total_seconds
             self.print_train_results(results)
-            client = luigi.contrib.gcs.GCSClient()
-            client.put_string(
-                json.dumps(results, indent=2),
-                self.eval_path,
-            )
+            if self.eval_path.startswith("gs"):
+                client = luigi.contrib.gcs.GCSClient()
+                client.put_string(
+                    json.dumps(results, indent=2),
+                    self.eval_path,
+                )
+            else:
+                Path(self.eval_path).write_text(json.dumps(results, indent=2))
 
             # retrain on the full dataset
             model = pipeline.fit(df)
@@ -504,11 +492,14 @@ class RunInference(luigi.Task):
         )
 
     def output(self):
+        target = (
+            luigi.contrib.gcs.GCSTarget
+            if self.output_path.startswith("gs")
+            else luigi.LocalTarget
+        )
         return [
-            luigi.contrib.gcs.GCSTarget(f"{self.output_path}/predictions.csv"),
-            luigi.contrib.gcs.GCSTarget(
-                f"{self.output_path}/predictions_with_text.csv"
-            ),
+            target(f"{self.output_path}/predictions.csv"),
+            target(f"{self.output_path}/predictions_with_text.csv"),
         ]
 
     def run(self):
@@ -577,7 +568,12 @@ class FormatTrec(luigi.Task):
     system_name = luigi.Parameter(default="baseline")
 
     def output(self):
-        return luigi.contrib.gcs.GCSTarget(self.output_path)
+        target = (
+            luigi.contrib.gcs.GCSTarget
+            if self.output_path.startswith("gs")
+            else luigi.LocalTarget
+        )
+        return target(self.output_path)
 
     def run(self):
         df = pd.read_csv(self.input_path)
@@ -608,7 +604,6 @@ class Workflow(luigi.Task):
             "count": ProcessCountTFIDF,
             "hashing": ProcessHashingTFIDF,
             "word2vec": ProcessWord2Vec,
-            "transformer": ProcessSentenceTransformer,
         }
         feature_columns = {
             "count": "tfidf",
@@ -687,7 +682,7 @@ if __name__ == "__main__":
                 # ("word2vec", "nb"), # must be non-negative
                 ("count", "logistic"),
                 ("word2vec", "logistic"),
-                ("transformer", "logistic"),
+                # ("transformer", "logistic"),
                 ("count", "fm"),
                 ("word2vec", "fm"),
                 # ("transformer", "fm"),
