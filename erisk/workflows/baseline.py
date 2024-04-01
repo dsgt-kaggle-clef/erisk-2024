@@ -3,6 +3,7 @@ import time
 from argparse import ArgumentParser
 from functools import reduce
 from pathlib import Path
+import zlib
 
 import luigi
 import luigi.contrib.gcs
@@ -454,7 +455,24 @@ class RunInference(luigi.Task):
         return df
 
     @staticmethod
+    def filter_compression_ratio(df, threshold=0.5):
+        # filter out the compression ratio
+        @F.udf("integer")
+        def compress_text_len(text):
+            return len(zlib.compress(text.encode()))
+
+        return (
+            df.withColumn(
+                "compression_ratio",
+                compress_text_len(F.col("text")) / F.length(F.col("text")),
+            )
+            .where(F.col("compression_ratio") > threshold)
+            .drop("compression_ratio")
+        )
+
+    @staticmethod
     def materialize_predictions(spark, output, df, primary_key="docid"):
+        df = RunInference.filter_compression_ratio(df)
         target_probs = [c for c in df.columns if c.endswith("_probability")]
         target_probs_relevant = [vector_to_array(c)[1].alias(c) for c in target_probs]
         subset = df.select(primary_key, *target_probs_relevant)
@@ -473,7 +491,7 @@ class RunInference(luigi.Task):
                 F.lit(int(c.split("_")[1])).alias("symptom_number"),
                 primary_key,
                 F.col(c).alias("score"),
-            ).where(F.col("score") > 0.7)
+            ).where(F.col("score") > 0.5)
             top_docs.append(ordered)
 
         # union all the documents together

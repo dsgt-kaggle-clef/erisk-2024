@@ -89,7 +89,7 @@ class Workflow(luigi.Task):
     input_path = luigi.Parameter()
     dataset_path = luigi.Parameter()
     output_path = luigi.Parameter()
-    version = "v4"
+    version = "v5"
 
     def run(self):
         # run the transformer task
