@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 
 import luigi
+import luigi.contrib.gcs
 from pyspark.ml import Pipeline
 from pyspark.ml.functions import vector_to_array
 from pyspark.sql import DataFrame
@@ -22,7 +23,12 @@ class ProcessSubsetBase(luigi.Task):
 
     def output(self):
         # save both the model pipeline and the dataset
-        return luigi.LocalTarget(f"{self.output_path}/_SUCCESS")
+        target = (
+            luigi.contrib.gcs.GCSTarget
+            if self.output_path.startswith("gs")
+            else luigi.LocalTarget
+        )
+        return target(f"{self.output_path}/_SUCCESS")
 
     @property
     def feature_columns(self) -> list:
@@ -96,25 +102,26 @@ class Workflow(luigi.Task):
             yield TrainLogisticRegressionModel(
                 train_labels_path=self.train_labels_path,
                 dataset_path=f"{self.dataset_path}/data",
-                model_path=f"{self.output_path}/{feature_column}_logistic/model",
-                eval_path=f"{self.output_path}/{feature_column}_logistic/eval.json",
+                model_path=f"{self.output_path}/logistic_{feature_column}/{self.version}/model",
+                eval_path=f"{self.output_path}/logistic_{feature_column}/{self.version}/eval.json",
                 feature_column=feature_column,
             )
             yield RunInference(
                 dataset_path=f"{self.dataset_path}/data",
-                model_path=f"{self.output_path}/{feature_column}_logistic/{self.version}/model",
-                output_path=f"{self.output_path}/{feature_column}_logistic/{self.version}/inference",
+                model_path=f"{self.output_path}/logistic_{feature_column}/{self.version}/model",
+                output_path=f"{self.output_path}/logistic_{feature_column}/{self.version}/inference",
                 feature_column=feature_column,
             )
             yield FormatTrec(
-                input_path=f"{self.output_path}/{feature_column}_logistic/{self.version}/inference/predictions.csv",
-                output_path=f"{self.output_path}/{feature_column}_logistic/{self.version}/inference/predictions.trec",
-                system_name=f"{feature_column}_logistic_{self.version}",
+                input_path=f"{self.output_path}/logistic_{feature_column}/{self.version}/inference/predictions.csv",
+                output_path=f"{self.output_path}/logistic_{feature_column}/{self.version}/inference/predictions.trec",
+                system_name=f"logistic_{feature_column}_{self.version}",
             )
 
 
 def parse_args():
     parser = ArgumentParser()
+    parser.add_argument("--base-uri", default="gs://dsgt-clef-erisk-2024/task1")
     parser.add_argument(
         "--scheduler-host", default="services.us-central1-a.c.dsgt-clef-2024.internal"
     )
@@ -123,7 +130,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    base_uri = "/mnt/data/erisk/task1"
+    base_uri = args.base_uri
 
     luigi.build(
         [

@@ -28,7 +28,6 @@ from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
 from erisk.utils import spark_resource
-from erisk.workflows.utils import WrappedSentenceTransformer
 
 
 class ProcessBase(luigi.Task):
