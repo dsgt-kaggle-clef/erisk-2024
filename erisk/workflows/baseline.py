@@ -1,33 +1,34 @@
 import json
 import time
+from argparse import ArgumentParser
 from functools import reduce
-import os
+from pathlib import Path
+import zlib
 
 import luigi
 import luigi.contrib.gcs
 import numpy as np
+import pandas as pd
 import tqdm
 from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.classification import NaiveBayes, LogisticRegression, FMClassifier
+from pyspark.ml.classification import FMClassifier, LogisticRegression, NaiveBayes
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.ml.feature import (
     IDF,
+    CountVectorizer,
     HashingTF,
     MinMaxScaler,
+    SQLTransformer,
     StandardScaler,
+    StopWordsRemover,
     Tokenizer,
     Word2Vec,
-    StopWordsRemover,
-    CountVectorizer,
-    SQLTransformer,
 )
 from pyspark.ml.functions import array_to_vector, vector_to_array
-from pyspark.sql import Window, DataFrame
+from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
-from argparse import ArgumentParser
 
 from erisk.utils import spark_resource
-from erisk.workflows.utils import WrappedSentenceTransformer
 
 
 class ProcessBase(luigi.Task):
@@ -85,6 +86,9 @@ class ProcessBase(luigi.Task):
     def transform(self, model, df, features) -> DataFrame:
         transformed = model.transform(df)
         for c in features:
+            # check if the feature is a vector and convert it to an array
+            if "array" in transformed.schema[c].simpleString():
+                continue
             transformed = transformed.withColumn(c, vector_to_array(F.col(c)))
         return transformed
 
@@ -175,27 +179,6 @@ class ProcessWord2Vec(ProcessBase):
         return Pipeline(stages=[tokenizer, remover, word2Vec])
 
 
-class ProcessSentenceTransformer(ProcessBase):
-    model_name = luigi.Parameter(default="all-MiniLM-L6-v2")
-    batch_size = luigi.IntParameter(default=8)
-
-    @property
-    def feature_columns(self):
-        return ["embedding"]
-
-    def pipeline(self):
-        return Pipeline(
-            stages=[
-                WrappedSentenceTransformer(
-                    input_col="text",
-                    output_col="embedding",
-                    model_name=self.model_name,
-                    batch_size=self.batch_size,
-                )
-            ]
-        )
-
-
 class TrainModelBase(luigi.Task):
     train_labels_path = luigi.Parameter()
     dataset_path = luigi.Parameter()
@@ -284,19 +267,29 @@ class TrainModelBase(luigi.Task):
         raise NotImplementedError()
 
     def output(self):
+        target = (
+            luigi.contrib.gcs.GCSTarget
+            if self.model_path.startswith("gs")
+            else luigi.LocalTarget
+        )
         return [
-            luigi.contrib.gcs.GCSTarget(self.model_path),
-            luigi.contrib.gcs.GCSTarget(self.eval_path),
+            target(self.model_path),
+            target(self.eval_path),
         ]
 
     def run(self):
         with spark_resource() as spark:
             start_time = time.time()
-            df = self.pivot_training(
-                self.load_dataset(spark, self.train_labels_path, self.dataset_path),
-                [self.feature_column],
-            ).cache()
+            df = (
+                self.pivot_training(
+                    self.load_dataset(spark, self.train_labels_path, self.dataset_path),
+                    [self.feature_column],
+                )
+                .repartition(32)
+                .cache()
+            )
             df.printSchema()
+            print(f"row count: {df.count()}")
             pipeline = self.build_model_pipeline(
                 self.feature_column, [c for c in df.columns if c.startswith("target_")]
             )
@@ -310,11 +303,16 @@ class TrainModelBase(luigi.Task):
             total_seconds = time.time() - start_time
             results["time"] = total_seconds
             self.print_train_results(results)
-            client = luigi.contrib.gcs.GCSClient()
-            client.put_string(
-                json.dumps(results, indent=2),
-                self.eval_path,
-            )
+            if self.eval_path.startswith("gs"):
+                client = luigi.contrib.gcs.GCSClient()
+                client.put_string(
+                    json.dumps(results, indent=2),
+                    self.eval_path,
+                )
+            else:
+                path = Path(self.eval_path)
+                path.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(results, indent=2))
 
             # retrain on the full dataset
             model = pipeline.fit(df)
@@ -457,7 +455,24 @@ class RunInference(luigi.Task):
         return df
 
     @staticmethod
+    def filter_compression_ratio(df, threshold=0.5):
+        # filter out the compression ratio
+        @F.udf("integer")
+        def compress_text_len(text):
+            return len(zlib.compress(text.encode()))
+
+        return (
+            df.withColumn(
+                "compression_ratio",
+                compress_text_len(F.col("text")) / F.length(F.col("text")),
+            )
+            .where(F.col("compression_ratio") > threshold)
+            .drop("compression_ratio")
+        )
+
+    @staticmethod
     def materialize_predictions(spark, output, df, primary_key="docid"):
+        df = RunInference.filter_compression_ratio(df)
         target_probs = [c for c in df.columns if c.endswith("_probability")]
         target_probs_relevant = [vector_to_array(c)[1].alias(c) for c in target_probs]
         subset = df.select(primary_key, *target_probs_relevant)
@@ -476,7 +491,7 @@ class RunInference(luigi.Task):
                 F.lit(int(c.split("_")[1])).alias("symptom_number"),
                 primary_key,
                 F.col(c).alias("score"),
-            ).where(F.col("score") > 0.7)
+            ).where(F.col("score") > 0.5)
             top_docs.append(ordered)
 
         # union all the documents together
@@ -500,11 +515,14 @@ class RunInference(luigi.Task):
         )
 
     def output(self):
+        target = (
+            luigi.contrib.gcs.GCSTarget
+            if self.output_path.startswith("gs")
+            else luigi.LocalTarget
+        )
         return [
-            luigi.contrib.gcs.GCSTarget(f"{self.output_path}/predictions.csv"),
-            luigi.contrib.gcs.GCSTarget(
-                f"{self.output_path}/predictions_with_text.csv"
-            ),
+            target(f"{self.output_path}/predictions.csv"),
+            target(f"{self.output_path}/predictions_with_text.csv"),
         ]
 
     def run(self):
@@ -567,6 +585,30 @@ class RunInference(luigi.Task):
             )
 
 
+class FormatTrec(luigi.Task):
+    input_path = luigi.Parameter()
+    output_path = luigi.Parameter()
+    system_name = luigi.Parameter(default="baseline")
+
+    def output(self):
+        target = (
+            luigi.contrib.gcs.GCSTarget
+            if self.output_path.startswith("gs")
+            else luigi.LocalTarget
+        )
+        return target(self.output_path)
+
+    def run(self):
+        df = pd.read_csv(self.input_path)
+        df.sort_values(["symptom_number", "position_in_ranking"]).rename(
+            columns=dict(Qo="Q0")
+        )
+        # replace the system name if necessary
+        df["system_name"] = self.system_name
+        # write as a tab-separated file
+        df.to_csv(self.output_path, sep="\t", index=False)
+
+
 class Workflow(luigi.Task):
     train_parquet_path = luigi.Parameter()
     test_parquet_path = luigi.Parameter()
@@ -585,7 +627,6 @@ class Workflow(luigi.Task):
             "count": ProcessCountTFIDF,
             "hashing": ProcessHashingTFIDF,
             "word2vec": ProcessWord2Vec,
-            "transformer": ProcessSentenceTransformer,
         }
         feature_columns = {
             "count": "tfidf",
@@ -620,11 +661,19 @@ class Workflow(luigi.Task):
             feature_column=feature_columns[self.processor],
             k=100 if self.sample_data else 1000,
         )
+        yield FormatTrec(
+            input_path=f"{self.output_path}/inference/predictions.csv",
+            output_path=f"{self.output_path}/inference/predictions.trec",
+            system_name=f"{self.processor}_{self.model}",
+        )
 
 
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--sample-data", action="store_true", default=False)
+    parser.add_argument(
+        "--scheduler-host", default="services.us-central1-a.c.dsgt-clef-2024.internal"
+    )
     return parser.parse_args()
 
 
@@ -656,11 +705,11 @@ if __name__ == "__main__":
                 # ("word2vec", "nb"), # must be non-negative
                 ("count", "logistic"),
                 ("word2vec", "logistic"),
-                ("transformer", "logistic"),
+                # ("transformer", "logistic"),
                 ("count", "fm"),
                 ("word2vec", "fm"),
-                ("transformer", "fm"),
+                # ("transformer", "fm"),
             ]
         ],
-        scheduler_host="services.us-central1-a.c.dsgt-clef-2024.internal",
+        scheduler_host=args.scheduler_host,
     )

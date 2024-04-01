@@ -10,7 +10,7 @@ os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 def get_spark(
     cores=os.cpu_count(),
-    memory=f"{os.cpu_count()*3}g",
+    memory=os.environ.get("PYSPARK_DRIVER_MEMORY", f"{os.cpu_count()*3}g"),
     local_dir="/mnt/data/tmp",
     **kwargs,
 ):

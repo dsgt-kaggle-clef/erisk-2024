@@ -1,10 +1,10 @@
+import numpy as np
 from pyspark.ml import Transformer
+from pyspark.ml.functions import predict_batch_udf
 from pyspark.ml.param.shared import HasInputCol, HasOutputCol
 from pyspark.ml.util import DefaultParamsReadable, DefaultParamsWritable
 from pyspark.sql import DataFrame
 from pyspark.sql.types import ArrayType, FloatType
-import numpy as np
-from pyspark.ml.functions import predict_batch_udf
 
 
 class WrappedSentenceTransformer(
@@ -34,7 +34,12 @@ class WrappedSentenceTransformer(
         """Return PredictBatchFunction using a closure over the model"""
         from sentence_transformers import SentenceTransformer
 
-        return SentenceTransformer(self.model_name).encode
+        model = SentenceTransformer(self.model_name)
+
+        def predict(inputs: np.ndarray) -> np.ndarray:
+            return model.encode(inputs)
+
+        return predict
 
     def _transform(self, df: DataFrame):
         return df.withColumn(
