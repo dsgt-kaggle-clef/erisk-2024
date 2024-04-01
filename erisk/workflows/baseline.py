@@ -280,10 +280,14 @@ class TrainModelBase(luigi.Task):
     def run(self):
         with spark_resource() as spark:
             start_time = time.time()
-            df = self.pivot_training(
-                self.load_dataset(spark, self.train_labels_path, self.dataset_path),
-                [self.feature_column],
-            ).cache()
+            df = (
+                self.pivot_training(
+                    self.load_dataset(spark, self.train_labels_path, self.dataset_path),
+                    [self.feature_column],
+                )
+                .repartition(32)
+                .cache()
+            )
             df.printSchema()
             print(f"row count: {df.count()}")
             pipeline = self.build_model_pipeline(
@@ -306,7 +310,9 @@ class TrainModelBase(luigi.Task):
                     self.eval_path,
                 )
             else:
-                Path(self.eval_path).write_text(json.dumps(results, indent=2))
+                path = Path(self.eval_path)
+                path.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(results, indent=2))
 
             # retrain on the full dataset
             model = pipeline.fit(df)
