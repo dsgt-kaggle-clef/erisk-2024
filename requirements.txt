@@ -1,0 +1,22 @@
+numpy
+pandas
+matplotlib
+pyspark >= 3.4.0
+pyarrow
+scikit-learn
+torch
+torchvision
+transformers
+sentence-transformers
+trectools
+
+luigi
+google-api-python-client
+google-auth
+gcsfs
+fsspec
+
+# developer tools
+jupyterlab
+black
+pre-commit
